@@ -6,264 +6,180 @@
 
 ## 1. Problem Statement
 
-A growing astrology services business relied on a third-party WhatsApp BSP (Business Service Provider) that charged per-agent monthly subscriptions and provided no custom AI integration. Customer support response times averaged **4–12 hours**, and there was no way to inject the company's proprietary knowledge base into chat conversations.
+A high-volume consumer astrology business relied on a third-party WhatsApp BSP (Business Service Provider) that charged recurring per-agent monthly subscriptions and provided no custom AI capabilities. Support response times averaged **4–12 hours**, conversion drop-offs occurred on external web redirect links, and there was no way to inject the company's proprietary knowledge base or sync real-time CRM deal states across WhatsApp, Facebook, and Instagram.
 
-**Design Goals:**
-- Eliminate BSP subscription costs by integrating directly with Meta's WhatsApp Cloud API
-- Reduce median response time to **< 30 seconds** using AI auto-responders
-- Maintain brand voice consistency via a self-hosted RAG knowledge base
-- Give human agents a shared real-time inbox with full AI assistance features
-- Implement complete observability over AI costs, queue health, and delivery status
+**Core Design Goals:**
+- **Eliminate BSP subscription fees** by integrating directly with Meta's Omnichannel Graph APIs (WhatsApp, Messenger, Instagram).
+- **Reduce median response time to < 30 seconds** with autonomous multi-provider AI auto-responders.
+- **Support in-chat conversational checkout** to collect birth details and generate orders without dropping off to external websites.
+- **Guarantee zero duplicate responses & race conditions** via atomic distributed locking on rapid customer message bursts.
+- **Enforce strict marketing guardrails** (frequency caps, STOP opt-out compliance, tiered delivery failure suppressions).
+- **Prevent silent platform outages** via proactive health monitors and token auto-renewal watchdog loops.
+- **Track end-to-end sales attribution** across WhatsApp, Facebook Messenger, and Instagram Direct.
 
 ---
 
 ## 2. Architecture Philosophy
 
-### Async-First Design
+### Async-First Ingestion with Sub-2s Boundary
+Meta Cloud APIs enforce a hard **2-second webhook timeout**. If a webhook does not return HTTP 200 within 2000ms, Meta marks delivery as failed and retries, creating severe risk of duplicate message processing.
 
-The most critical constraint in WhatsApp webhook processing is Meta's **2-second response window** — if the server doesn't respond within 2 seconds, Meta retries the delivery (causing duplicate processing).
+**Design**: The Express webhook controller acts purely as a non-blocking ingestion gate:
+1. Constant-time HMAC-SHA256 signature verification (< 5ms).
+2. Instant Redis enqueueing to `inbound-msg-queue` (< 10ms).
+3. Immediate return of `HTTP 200 EVENT_RECEIVED` (< 20ms total).
 
-**Solution**: The webhook controller performs only two synchronous operations:
-1. Validate the HMAC signature
-2. Push the raw payload to a Redis queue
+All business processing (contact lookup, thread creation, RAG semantic search, LLM tool execution, CRM sync, database writes, and outbound dispatches) is fully decoupled into BullMQ background workers.
 
-Everything else — contact resolution, AI inference, database writes, outbound dispatch — runs in decoupled BullMQ background workers.
+### Distributed Concurrency & Locking
+Customers frequently send rapid sequences of messages within seconds (e.g. "Hi", "Are you there?", "I want to check my marriage Kundli"). In an asynchronous queue worker pool, these messages could be picked up concurrently by multiple worker threads, resulting in duplicate AI inferences, conflicting order states, and overlapping replies.
 
-```
-Webhook Controller → (< 2ms) → Redis Enqueue → HTTP 200 → Meta
-                                         ↓
-                                  BullMQ Worker (async, unlimited time)
-```
-
-### Event-Driven State Synchronization
-
-All state mutations (new messages, status updates, conversation updates) are broadcast via Socket.io **from the worker**, not the HTTP controller. This keeps the real-time inbox perfectly synchronized across all connected agents without polling.
+**Solution**: Redis-backed **Atomic Distributed Locking** (`DistributedLock`):
+- Before processing an inbound message for a conversation, the worker attempts an atomic Redis lock:
+  ```
+  SET lock:conv:{conversationId} {uuidToken} PX 30000 NX
+  ```
+- If the lock is already held by another worker, the concurrent job is dropped or deferred.
+- Lock release uses an atomic Lua script that verifies the token before deletion:
+  ```lua
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+  else
+    return 0
+  end
+  ```
+- This guarantees **single-threaded serial execution per conversation** across distributed worker processes.
 
 ---
 
-## 3. Database Design
+## 3. Database Design & Schemas
 
-### MongoDB — Primary Relational Store
+### MongoDB Atlas — Primary State & Entity Store
 
-MongoDB was selected over a relational SQL database for the following reasons:
-- WhatsApp message payloads are semi-structured JSON — document storage maps naturally
-- Flexible `metadata` (Mixed) field on Conversation allows storing arbitrary Zoho data without schema migrations
-- Native ObjectId references provide sufficient relational integrity for this scale
+MongoDB handles semi-structured omnichannel payloads, conversation states, and audit trails across 23 Mongoose schemas:
 
-#### Index Strategy
+#### High-Performance Indexing Strategy
 
 | Collection | Index | Purpose |
 |-----------|-------|---------|
-| `Contact` | `{ phoneNumber: 1 }` unique | Fast phone lookup on every inbound message |
-| `Contact` | `{ email: 1 }` | Zoho Books invoice lookup by email |
-| `Message` | `{ conversationId: 1 }` | Load chat history for a thread |
-| `Message` | `{ metaWamid: 1 }` unique sparse | Idempotency — prevent duplicate message saves |
-| `Message` | `{ status: 1 }` | Filter draft/pending messages |
-| `Conversation` | `{ contactId: 1 }` | Resolve active thread for incoming contact |
-| `Conversation` | `{ lastMessageAt: -1 }` | Sort inbox list by most recent |
-| `CostTracking` | `{ createdAt: 1, provider: 1 }` compound | Time-series cost aggregation queries |
-| `AuditLog` | `{ userId: 1, createdAt: -1 }` compound | Paginated audit trail per operator |
-
-### Qdrant — Vector Database
-
-The PRD initially specified Pinecone (cloud-managed). During implementation, the decision was made to **migrate to self-hosted Qdrant** for:
-- **Zero vector query egress costs**
-- **No external dependency** for the RAG pipeline
-- **Full control** over collection configuration and similarity thresholds
-
-**Collection configuration:**
-```
-Name: drishti-knowledge
-Vector size: 1536 floats (OpenAI text-embedding-3-small output)
-Distance metric: Cosine similarity
-Similarity threshold: 0.3 (configurable via GlobalConfig)
-```
-
-**Chunk deduplication:** Each text chunk is sanitized (emoji surrogate removal), MD5-hashed, then converted to a UUID for use as the Qdrant point ID. This prevents duplicate chunk uploads on re-ingestion of the same document.
-
-### Redis — Queue Backplane + Cache Layer
-
-Redis serves two distinct roles:
-
-**1. BullMQ Queue Backplane (primary use)**
-
-| Queue | Worker | Concurrency | Retry Policy |
-|-------|--------|-------------|--------------|
-| `inbound-msg-queue` | InboundWorker | Configurable | Exponential backoff |
-| `outbound-msg-queue` | OutboundWorker | Configurable | 3 attempts, 1s delay |
-| `vector-ingest-queue` | VectorWorker | 1 (sequential) | Standard retry |
-| `status-msg-queue` | StatusWorker | Configurable | Standard retry |
-
-All queues are configured with `removeOnFail: { age: 86400, count: 1000 }` to prevent Redis memory accumulation from failed job retention.
-
-**2. Zoho API Response Cache**
-
-| Cache Key | TTL | Rationale |
-|-----------|-----|-----------|
-| `zoho:books:invoices:{email}` | 15 minutes | Invoice data changes infrequently; rate limit protection |
-| Zoho CRM Contact + Deals | None (disabled) | Real-time sync required for deal stage accuracy in AI context |
+| `Contact` | `{ phoneNumber: 1 }` unique | WhatsApp identity lookup on ingress |
+| `Contact` | `{ email: 1 }` | Secondary account & Zoho Books lookup |
+| `MetaAccount` | `{ pageId: 1 }` unique | Routing Facebook Messenger webhooks |
+| `MetaAccount` | `{ instagramAccountId: 1 }` unique sparse | Routing Instagram Direct webhooks |
+| `Conversation` | `{ channelType: 1, lastMessageAt: -1 }` compound | Satisfies inbox list filter + sort in single index scan |
+| `Conversation` | `{ whatsAppAccountId: 1, lastMessageAt: -1 }` compound | Multi-WABA inbox filter & sorting |
+| `Conversation` | `{ metaAccountId: 1, lastMessageAt: -1 }` compound | Social inbox account filter & sorting |
+| `Conversation` | `{ customerReplyWindowExpiresAt: 1 }` | Efficient background query for expired 24h Meta sessions |
+| `Message` | `{ metaWamid: 1 }` unique sparse | Idempotency — rejects duplicate Meta webhook retries |
+| `Message` | `{ conversationId: 1, createdAt: -1 }` compound | Fast thread message retrieval |
+| `MarketingSend` | `{ phoneNumber: 1, templateName: 1, sentAt: -1 }` compound | Real-time frequency cap evaluation |
+| `CostTracking` | `{ createdAt: 1, provider: 1 }` compound | Real-time token spend trend aggregations |
+| `Feedback` | `{ conversationId: 1 }` | Fast CSAT survey resolution |
 
 ---
 
-## 4. API Design
+## 4. Anti-Spam Marketing Guardrails (`MarketingGuard`)
 
-### REST Design Principles
+WhatsApp enforces strict template quality ratings. Spreading unconstrained marketing messages risks template pausing or business account bans. `MarketingGuard` intercepts all outbound messages:
 
-- **Resource-oriented URLs** — `/conversations/:id/messages`, `/conversations/:id/toggle-ai`
-- **HTTP semantics** — `POST` for mutations, `GET` for reads, `DELETE` for removals
-- **Unified response envelope** — `{ success: boolean, data?: any, message?: string }`
-- **Correlation IDs** — every request generates a correlation ID for distributed tracing
+```mermaid
+graph TD
+    MSG([Outbound Template Request]) --> CAT{Template Category}
+    CAT -->|UTILITY or AUTH| DISPATCH[Allowed: Immediate Dispatch\nNever blocked by marketing rules]
+    CAT -->|MARKETING| CHECK_OPT{Contact marketingOptOut?}
+    CHECK_OPT -->|true| DROP1[Blocked: User replied STOP]
+    CHECK_OPT -->|false| CHECK_HARD{marketingHardSuppressed?}
+    CHECK_HARD -->|true| DROP2[Blocked: Permanent failure / Invalid number]
+    CHECK_HARD -->|false| CHECK_TEMP{marketingSuppressExpiresAt > now?}
+    CHECK_TEMP -->|true| DROP3[Blocked: 24h Meta Ecosystem Pause active]
+    CHECK_TEMP -->|false| CAP_CHECK{Frequency Caps Exceeded?}
 
-### Authentication Architecture
-
+    CAP_CHECK -->|Same template sent < 24h| DROP4[Blocked: Max 1 per template per 24h]
+    CAP_CHECK -->|Total marketing sent >= 3 in 7d| DROP5[Blocked: Max 3 marketing per 7 days]
+    CAP_CHECK -->|Within Limits| LOG_SEND[Log to MarketingSend\nDispatch via Meta API]
 ```
-Browser → POST /auth/login → JWT issued (HttpOnly, Secure, SameSite=Lax cookie)
-                           → If twoFactorEnabled: returns requires2fa flag
-       → POST /auth/login/2fa (TOTP token) → JWT issued
-       → All subsequent requests: JWT cookie parsed by authenticateJwt middleware
-```
 
-**Security properties:**
-- Passwords hashed with bcrypt (10 rounds)
-- JWT contains only `{ id, role, email }` — no sensitive data in token payload
-- HttpOnly cookies prevent XSS token theft
-- TOTP 2FA via `otplib` + QR code generation for authenticator app enrollment
-- Session cleared server-side on logout (cookie cleared)
-
-### Webhook Security
-
-Meta webhook signatures use HMAC-SHA256. The implementation:
-1. Reads the raw request body buffer (not parsed JSON) before JSON middleware processes it
-2. Computes `hmac-sha256(body, META_APP_SECRET)`
-3. Compares against `x-hub-signature-256` header using **`crypto.timingSafeEqual`** to prevent timing attacks
-
-### Role-Based Access Control
-
-| Endpoint Category | `agent` | `admin` |
-|------------------|---------|---------|
-| View conversations, send messages | ✅ | ✅ |
-| Toggle AI mode | ✅ | ✅ |
-| View Zoho CRM sidebar | ✅ | ✅ |
-| Request refund (Zoho CRM write) | ✅ | ✅ |
-| Register new users | ❌ | ✅ |
-| View analytics / cost dashboard | ❌ | ✅ |
-| Configure AI providers / system prompt | ❌ | ✅ |
-| Manage queue jobs (retry/delete) | ❌ | ✅ |
-| Upload knowledge base documents | ❌ | ✅ |
-| Sync and broadcast templates | ❌ | ✅ |
-
-### External API Integration Design
-
-**Meta WhatsApp Cloud API:**
-- All outbound dispatches use message type-specific payload schemas (text, template, image, interactive)
-- Template broadcasts compile `{{1}}` placeholder variables with provided parameters before saving to DB
-- Outbound worker implements exponential backoff (3 attempts, 1s initial delay) for transient Meta API failures
-
-**Zoho OAuth:**
-- Access tokens stored in `ZohoToken` collection with `expiresAt` timestamp
-- `zohoAuth.ts` implements automatic token refresh on expiry
-- India DC endpoint (`zoho.in`) required for accounts in the Indian data center
+### Tiered Delivery-Failure Suppression
+When Meta delivery status webhooks return `"failed"`, the error codes are classified:
+1. **Permanent Suppression (`marketingHardSuppressed = true`)**:
+   - Meta code `131050`: User opted out at the Meta OS level.
+   - Meta code `131026`: Undeliverable / invalid phone number.
+2. **Temporary 24h Suppression (`marketingSuppressExpiresAt = now + 24h`)**:
+   - Meta code `131049`: Meta accepted then dropped the message "to maintain healthy ecosystem engagement" (the user received too many marketing messages across all brands).
+   - **Critical Rule**: Pauses marketing for exactly 24 hours. Never blocks transactional order/payment messages.
 
 ---
 
-## 5. Scalability Considerations
+## 5. Conversation Lifecycle & Meta 24-Hour Reply Window
 
-### Current Architecture Limits
+Meta restricts free-form text messaging to within **24 hours of the customer's last inbound message**. Beyond 24 hours, businesses may only communicate using pre-approved paid Meta Templates.
 
-| Component | Current Design | Scale-Out Path |
-|-----------|---------------|----------------|
-| Webhook ingestion | Single EC2 instance | Add load balancer + multiple API instances |
-| BullMQ workers | Single process | Scale worker concurrency; run workers on separate instances |
-| MongoDB | Atlas managed cluster | Vertical scale; sharding by `contactId` if needed |
-| Qdrant | Single container | Qdrant distributed cluster mode |
-| Redis | Single container | Redis Cluster or Redis Sentinel for HA |
-| WebSocket | Single Socket.io server | Redis adapter for multi-instance Socket.io |
-
-### Horizontal Scaling Path
-
-The architecture is designed to be **horizontally scalable** with known, well-defined upgrade steps:
-
-1. **Multiple API instances** → Add Nginx upstream balancing
-2. **Multi-node WebSocket** → Enable Socket.io Redis adapter (`@socket.io/redis-adapter`)
-3. **Worker autoscaling** → Increase `concurrency` in BullMQ worker config; run dedicated worker processes
-4. **Multi-tenant** → Scope all collections with a `tenantId` field
-
-### Performance Optimizations Implemented
-
-- **Bun runtime** for the Express API — faster startup and improved throughput over Node.js
-- **Next.js standalone output** — self-contained production build, no `node_modules` copying
-- **Redis caching** for Zoho Books invoices (15min TTL) to prevent API rate limit exhaustion
-- **Compound indexes** on `CostTracking` and `AuditLog` for O(log n) aggregation queries
-- **Docker BuildKit** with cache mounts for fast CI/CD image builds
+### The Auto-Close Engine (`conversationWindow.ts`)
+Leaving expired conversations in the "Open" inbox creates operator confusion and stale memory footprints. A dedicated background service manages window lifecycles:
+- **Tracking**: Inbound messages record `lastCustomerMessageAt` and compute `customerReplyWindowExpiresAt = lastCustomerMessageAt + 24h`.
+- **Auto-Close Service**: Runs every 60 seconds, processing expired conversations in batches of 500:
+  - Closes threads whose 24h reply window has lapsed.
+  - Clears stale `"needsHumanAttention"` flags on automated threads.
+  - **Exception**: Keeps threads open past 24 hours *only* if `isAiActive === false` AND `needsHumanAttention === true` (a live human operator is actively working the escalation).
+- **Graceful Reopening**: If a customer replies to a closed conversation, the inbound worker seamlessly transitions status to `"open"` and preserves previous AI configuration.
 
 ---
 
-## 6. Observability Design
+## 6. Deterministic Language & Script Detection Engine (`replyLanguage.ts`)
 
-### Logging
+Leaving language choice to LLM inference produced severe issues: models frequently drifted from English into Hinglish or Devanagari Hindi simply because the customer had an Indian name or used a neutral greeting like "Hi".
 
-All backend logs are structured JSON objects emitted to `stdout`:
+### Code-Level Script Analysis
+Instead of prompting the model to guess the language, `replyLanguage.ts` performs deterministic script analysis before the model is invoked:
 
-```json
-{
-  "service": "drishti-api",
-  "operation": "inboundWorker",
-  "correlationId": "uuid-v4",
-  "level": "info",
-  "message": "Message processed successfully",
-  "timestamp": "2026-06-01T12:00:00.000Z"
-}
-```
+1. **Non-Latin Scripts**: Regex script ranges detect Devanagari Hindi (`/[ऀ-ॿ]/`), Bengali, Punjabi, Gujarati, Odia, Tamil, Telugu, Kannada, Malayalam, and Urdu.
+2. **Roman Hinglish Markers**: Matches distinct function words (`aap`, `kaise`, `kya`, `nahi`, `chahiye`, `hoga`, `batao`) as isolated word boundaries (`\b`), preventing false positives (e.g. `hai` inside "Shanghai").
+3. **English Function Markers**: Distinct English functional words (`the`, `is`, `will`, `when`, `report`, `career`, `marriage`) identify true English intent.
+4. **Neutral Token Filtering**: Single tokens like "Hi", "Hello", "OK", "👍", or time strings ("9:30 AM") carry zero linguistic signal and inherit the thread's established language.
 
-In production, `NODE_ENV=production` disables file logging — all logs stream to stdout for collection by AWS CloudWatch or Promtail.
-
-### Health Check
-
-```
-GET /healthz
-→ 200 OK      if MongoDB state == "connected" AND Redis state == "ready"
-→ 503 Service Unavailable  otherwise
-```
-
-### Queue Observability
-
-Admin users can access the `/queues` dashboard to:
-- View active, waiting, completed, and failed job counts per queue
-- Inspect individual failed job payloads and error messages
-- Bulk retry or purge failed jobs
-- Delete individual problematic jobs
-
-### Cost Tracking
-
-Every LLM call records to `CostTracking`:
-- Provider and model name
-- Input + output token counts
-- Calculated cost in USD (based on configurable per-million-token pricing rates)
-- Conversation reference for attribution
-
-The `/dashboard` analytics page aggregates these records to show cost trends over time, broken down by provider.
+The detected language directive is injected into the system prompt as an imperative constraint, guaranteeing strict language and script fidelity.
 
 ---
 
-## 7. Security Design
+## 7. Native Function-Calling Tool Loop vs Prompt-Stuffing
 
-| Layer | Control | Implementation |
-|-------|---------|----------------|
-| **Webhook ingestion** | HMAC-SHA256 signature verification | `crypto.timingSafeEqual` constant-time comparison |
-| **API authentication** | JWT in HttpOnly Secure cookie | `authenticateJwt` middleware on all protected routes |
-| **2FA** | TOTP via Google Authenticator | `otplib` + QR code enrollment flow |
-| **Outbound API** | API key authentication | `x-api-key` header check |
-| **Password storage** | bcrypt hashing | 10 rounds |
-| **Sensitive link access** | Ownership verification | Deal ID + email cross-reference in Zoho CRM |
-| **AI guardrails** | Tool-level ownership checks | `shareReportLink` verifies phone/email before URL injection |
-| **Audit trail** | All admin actions logged | `AuditLog` collection with `userId`, `action`, `clientIp` |
-| **CORS** | Origin whitelist in production | Bypassed only for webhook and external trigger endpoints |
-| **Config validation** | Zod schema at boot | `process.exit(1)` if required env vars missing |
+| Dimension | Legacy Prompt-Stuffing | Native Function-Calling Loop (`agentTools.ts`) |
+|-----------|------------------------|------------------------------------------------|
+| **Architecture** | Guess customer data upfront & dump into prompt | LLM reasons about required data and invokes tools on demand |
+| **Tool Count** | ~8 static prompts | 26 specialized native tools |
+| **Data Freshness** | Pre-fetched snapshot (can be stale) | Live API call at time of reasoning |
+| **Payment Verification**| Hallucinated confirmations based on text | `verifyPayment` queries CRM and Books systems of record |
+| **Sensitive Links** | Pre-injected URLs risking exposure | Ownership check inside `shareReportLink` with loose name/DOB match |
+| **Order Booking** | External web redirect link | Conversational slot-filling in chat (`saveCheckoutDetails`, `createReportOrder`) |
+| **Token Efficiency** | Bloated prompts on every turn | Minimal base prompt; context added only when tools return data |
 
-### Privacy Guard — Sensitive Link Protection
+---
 
-One of the most important security features: the system **never exposes private report URLs or correction links** unless the customer provides both:
-1. Their exact **18–19 digit Zoho Deal ID** (extracted via regex from chat message)
-2. Their **email address** (matching the Zoho CRM contact record)
+## 8. Sales Funnel & Multi-Channel Attribution Analytics
 
-Both values are cross-verified against Zoho CRM before any link is injected into the AI's context window. If verification fails, the AI is instructed to politely withhold the link and ask for the required identifiers.
+### Channel Attribution
+To track revenue by marketing channel, every checkout and payment link generated by the AI includes dynamic UTM parameters:
+- **WhatsApp**: `utm_source=whatsapp_chat&utm_medium=agent&utm_campaign=...`
+- **Facebook Messenger**: `utm_source=facebook_chat&utm_medium=agent&utm_campaign=...`
+- **Instagram Direct**: `utm_source=instagram_chat&utm_medium=agent&utm_campaign=...`
+
+### Sales Funnel Stages
+The platform visualizes conversion drop-offs across 7 distinct stages:
+1. **Enquiry**: Inbound conversation opened.
+2. **Understand (Stage 2)**: AI completes discovery and identifies the customer's core concern.
+3. **Recommend (Stage 3)**: AI recommends a specific report.
+4. **Add to Cart**: Conversational slots filled.
+5. **Details Confirmed**: Customer validates read-back.
+6. **Order Created**: Order generated in Drishti server.
+7. **Payment Received**: Verified closed-won deal.
+
+---
+
+## 9. Observability & Proactive Health Watchdog
+
+### Proactive Health Monitor (`healthMonitor.ts`)
+Runs every 30 minutes to eliminate silent failure modes:
+1. **Meta Access Token Health**: Validates tokens via `graph.facebook.com/debug_token`. Warns 7 days before token expiration.
+2. **Instagram Token Auto-Renewal**: Automatically refreshes 60-day `IGAA` Instagram User access tokens at day 20 via Graph API.
+3. **Geocoder API Health**: Probes place-of-birth geocoding services to ensure order checkout will not fail.
+4. **WhatsApp Admin Alerts**: Immediately alerts engineering leads via Meta-approved `web_error_alert` WhatsApp templates upon detecting P1 outages.

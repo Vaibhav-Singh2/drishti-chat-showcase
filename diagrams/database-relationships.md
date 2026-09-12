@@ -7,7 +7,7 @@ erDiagram
         string email UK
         string passwordHash
         string name
-        string role "admin or agent"
+        string role "admin | agent"
         string twoFactorSecret
         bool twoFactorEnabled
         bool isActive
@@ -22,7 +22,37 @@ erDiagram
         string email
         string zohoContactId
         string zohoOwnerId
+        bool marketingOptOut
+        bool marketingHardSuppressed
+        string marketingSuppressReason
+        date marketingSuppressExpiresAt
         bool isActive
+        date createdAt
+        date updatedAt
+    }
+
+    MetaAccount {
+        ObjectId _id PK
+        string name
+        string channelType "messenger | instagram"
+        string pageId UK
+        string instagramAccountId UK
+        string pageAccessToken
+        date tokenRefreshedAt
+        string webhookVerifyToken
+        bool isActive
+        bool isDefault
+        date createdAt
+        date updatedAt
+    }
+
+    WhatsAppAccount {
+        ObjectId _id PK
+        string name
+        string phoneNumberId UK
+        string wabaId
+        string accessToken
+        bool isDefault
         date createdAt
         date updatedAt
     }
@@ -30,10 +60,18 @@ erDiagram
     Conversation {
         ObjectId _id PK
         ObjectId contactId FK
+        ObjectId whatsAppAccountId FK
+        ObjectId metaAccountId FK
+        string channelType "whatsapp | messenger | instagram | website"
         bool isAiActive
         bool isAiDraftMode
-        string status "open or closed"
+        string status "open | closed"
+        bool needsHumanAttention
+        string escalationReason
+        string feedbackStatus "pending | checkin | collecting | completed"
         date lastMessageAt
+        date lastCustomerMessageAt
+        date customerReplyWindowExpiresAt
         object metadata
         date createdAt
         date updatedAt
@@ -43,12 +81,12 @@ erDiagram
         ObjectId _id PK
         ObjectId conversationId FK
         ObjectId senderId FK
-        string direction "inbound or outbound"
-        string senderType "user or bot or contact"
+        string direction "inbound | outbound"
+        string senderType "user | bot | contact"
         string text
-        string messageType "text, template, image, document, interactive"
+        string messageType "text | template | image | document | interactive"
         string mediaUrl
-        string status "sent, delivered, read, failed, pending, draft"
+        string status "sent | delivered | read | failed | pending | draft"
         string metaWamid UK "sparse"
         string metaTemplateName
         string metaError
@@ -59,7 +97,7 @@ erDiagram
     AISession {
         ObjectId _id PK
         ObjectId conversationId FK, UK
-        string provider "claude, openai, gemini"
+        string provider "claude | openai | gemini"
         string modelName
         string systemPromptOverride
         number maxHistoryMessages
@@ -79,15 +117,40 @@ erDiagram
         date createdAt
     }
 
-    AuditLog {
+    MarketingSend {
         ObjectId _id PK
-        ObjectId userId FK
-        string action
-        string description
-        string resourceId
-        string resourceCollection
-        string clientIp
+        string phoneNumber
+        string templateName
+        string category
+        string status
+        date sentAt
         date createdAt
+    }
+
+    RefundRequest {
+        ObjectId _id PK
+        string dealId
+        ObjectId conversationId FK
+        string customerName
+        string customerPhone
+        string reason
+        string category
+        string trigger
+        string status "pending | submitted | approved | rejected"
+        date createdAt
+    }
+
+    Feedback {
+        ObjectId _id PK
+        ObjectId conversationId FK
+        ObjectId contactId FK
+        string status "sent | responded | completed"
+        bool solved
+        number rating "1-5"
+        string comment
+        string channelType
+        date createdAt
+        date updatedAt
     }
 
     KnowledgeDocument {
@@ -98,43 +161,28 @@ erDiagram
         string r2Url
         string summary
         number chunkCount
-        string status "processing, completed, failed"
-        string errorMessage
+        string status "processing | completed | failed"
         date createdAt
-        date updatedAt
-    }
-
-    Template {
-        ObjectId _id PK
-        string templateName UK
-        string category
-        string language
-        object components
-        string status "APPROVED, PENDING, REJECTED"
-        date createdAt
-        date updatedAt
     }
 
     GlobalConfig {
         ObjectId _id PK
         string key UK
+        string defaultProvider
         string defaultSystemPrompt
         number ragSimilarityThreshold
         number ragMaxHistoryMessages
-        string defaultProvider
-        string openaiModelName
-        string claudeModelName
-        string geminiModelName
-        ObjectId updatedBy FK
-        date createdAt
+        array adminAlertPhones
         date updatedAt
     }
 
-    Contact ||--o{ Conversation : "has one or many"
-    Conversation ||--o{ Message : "contains many"
-    User ||--o{ Message : "sends outbound"
-    Conversation ||--|| AISession : "has one AI config"
-    Conversation ||--o{ CostTracking : "tracks costs"
-    User ||--o{ AuditLog : "generates audit trail"
-    User }o--o| GlobalConfig : "last updated by"
+    Contact ||--o{ Conversation : "initiates"
+    WhatsAppAccount ||--o{ Conversation : "manages"
+    MetaAccount ||--o{ Conversation : "routes"
+    Conversation ||--o{ Message : "contains"
+    User ||--o{ Message : "sends"
+    Conversation ||--|| AISession : "configures"
+    Conversation ||--o{ CostTracking : "tracks"
+    Conversation ||--o{ Feedback : "evaluates"
+    Conversation ||--o{ RefundRequest : "logs"
 ```

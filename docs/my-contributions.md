@@ -6,191 +6,129 @@
 
 ## Overview
 
-I was the **sole engineer** responsible for designing and implementing Drishti Marketing OS end-to-end — from architecture decisions to production deployment. This document details what I personally built, owned, and shipped.
+I was the **sole full-stack engineer** responsible for designing, building, and scaling Drishti Marketing OS from an initial concept into an enterprise-grade omnichannel customer engagement operating system. I owned every tier of the product: architecture design, backend infrastructure, concurrency control, AI tool calling, frontend UI engineering, database modeling, and DevOps automation.
+
+This document outlines what I personally architected, built, and shipped into production.
 
 ---
 
-## 1. System Architecture Design
+## 1. System Architecture & Omnichannel Ingress
 
-**What I did:**
-
-Designed the entire system architecture from scratch, replacing the business's dependency on third-party WhatsApp BSP subscriptions (WATI/AISensy) with a custom-built platform. This involved:
-
-- Evaluating and selecting the Turborepo monorepo structure to manage two interconnected applications with shared configurations
-- Designing the async-first message pipeline using BullMQ + Redis to meet Meta's 2-second webhook constraint
-- Choosing MongoDB as the primary database and designing all collection schemas, indexes, and relationships
-- Making the vendor decision to migrate the RAG vector store from Pinecone to self-hosted Qdrant (cost reduction + zero external latency)
-- Designing the role-based access control model (admin vs agent) and the JWT + 2FA security stack
-
-**Impact**: The architecture supports unlimited concurrent AI conversations with a single deployment, replacing a per-agent billing model that capped support capacity.
+**What I designed and delivered:**
+- Designed the full Turborepo monorepo architecture uniting Next.js 16 and Express (Bun runtime).
+- Architected direct integrations with **Meta's WhatsApp Cloud API (v20.0)**, **Facebook Messenger API**, and **Instagram Graph API (v21.0)**, eliminating recurring third-party BSP subscription costs.
+- Designed multi-account routing schemas (`MetaAccount`, `WhatsAppAccount`) enabling simultaneous management of multiple WhatsApp Business Accounts, Facebook Pages, and Instagram Business profiles within a unified system.
+- Designed an async-first queue pipeline using BullMQ + Redis to satisfy Meta's 2-second webhook acknowledgement requirement, achieving sub-15ms ingest times.
 
 ---
 
-## 2. AI Pipeline & Multi-Provider Switchboard
+## 2. Distributed Concurrency & Locking Engine
 
 **What I built:**
-
-The complete AI inference engine that powers all automated responses:
-
-- **`aiSwitchboard.ts`**: Abstract provider router implementing `IAIProvider` interface for Claude 3.5, GPT-4o, and Gemini 1.5 Pro. Resolves provider from per-conversation `AISession` overrides falling back to `GlobalConfig` defaults. Implements multi-provider fallback chaining.
-
-- **`agentTools.ts`**: The native function-calling tool registry. Defined 10 tools including `lookupCustomerByPhone`, `lookupCustomerByEmail`, `getDealById`, `verifyPayment`, `searchKnowledgeBase`, `shareReportLink`, `requestRefund`, and `escalateToHuman`. Implemented the ownership verification logic inside `shareReportLink` and `shareCorrectionLink` — the server-side privacy guard that prevents unauthorized URL exposure.
-
-- **5-Part Context Assembly**: Designed and implemented the prompt assembly pipeline that combines brand guidelines + RAG chunks + conversation history + Zoho CRM context + user query into a structured multi-part system prompt.
-
-- **Cost Tracking**: Implemented per-call token usage logging to `CostTracking` with configurable per-million-token pricing rates for each provider, enabling real-time cost analytics.
+- Authored `DistributedLock.ts`, an atomic Redis locking system (`SET PX NX`) preventing race conditions when customers send rapid consecutive message bursts.
+- Implemented atomic lock release using custom Lua scripts to guarantee that only the worker holding the specific token can release the lock.
+- Solved duplicate AI inferences, conflicting order states, and out-of-order responses across horizontally distributed container workers.
 
 ---
 
-## 3. RAG Knowledge Base Pipeline
+## 3. Autonomous 26-Tool AI Agent Loop & Conversational Checkout
 
 **What I built:**
-
-End-to-end Retrieval-Augmented Generation system:
-
-- **`ragPipeline.ts`**: Vector similarity search using Qdrant REST client. Generates 1536-dimension query embeddings with OpenAI `text-embedding-3-small`. Applies configurable cosine similarity threshold (default 0.3, stored in `GlobalConfig`). Falls back to human takeover escalation if no relevant chunks found.
-
-- **`vectorWorker.ts`**: Background ingestion worker that:
-  - Validates uploaded files (rejects 0-byte files immediately)
-  - Extracts text from PDFs via `pdf-parse` and plain-text via UTF-8 conversion
-  - Sanitizes text to remove emoji surrogate characters (prevents Qdrant upsert failures)
-  - Generates embeddings and upserts to Qdrant with MD5-hash-derived UUIDs for deduplication
-  - Implements differentiated file cleanup — preserves temp file across retries, deletes only on success or final failure
-
-- **`qdrantClient.ts`**: Qdrant client wrapper with collection auto-initialization on boot, point upsert, similarity search, and UUID conversion utility (`toUUID()`).
+- Built the native function-calling agent loop in `aiSwitchboard.ts` and `agentTools.ts`, moving beyond static prompt-stuffing to an autonomous reasoning engine across Claude 3.5, GPT-4o, and Gemini 1.5 Pro.
+- Authored **26 specialized native tools** spanning customer lookup, payment verification, birth place geocoding, report delivery, self-serve corrections, and CSAT feedback.
+- Designed the **in-chat conversational checkout state machine** (`saveCheckoutDetails`, `geocodeBirthPlace`, `createReportOrder`):
+  - In-chat slot-filling collecting name, DOB, TOB, POB, and custom questions.
+  - Integration with Drishti core servers to geocode birth locations into canonical coordinates.
+  - Strict read-back confirmation gate before order generation.
+  - In-chat personalized UPI / Razorpay payment link generation, increasing checkout conversion rates.
+- Implemented **server-side privacy guardrails** inside `shareReportLink` with tolerant first-name and date-of-birth validation, preventing unauthorized URL exposure.
+- Authored the **stale payment claim heuristic**, detecting customer payment claims to prevent the AI from falsely claiming an order is unpaid while the CRM catches up.
+- Implemented keep-alive typing indicator heartbeats on WhatsApp to prevent typing status timeouts during multi-step tool reasoning.
 
 ---
 
-## 4. WhatsApp Webhook Processing Engine
+## 4. Deterministic Language & Script Detection Engine
 
 **What I built:**
-
-The complete inbound/outbound message processing pipeline:
-
-- **`webhookController.ts`**: Webhook entry point with HMAC-SHA256 signature verification using `crypto.timingSafeEqual` (timing-attack resistant). Designed the raw body capture approach — preserving `req.rawBody` buffer before JSON parsing middleware, since HMAC verification requires the original bytes.
-
-- **`inboundWorker.ts`**: The most complex component in the system. Handles:
-  - `metaWamid` idempotency checking to prevent duplicate processing
-  - Contact creation via Zoho CRM lookup (for new phone numbers)
-  - Conversation find-or-create with AI mode preservation on thread reopen
-  - Full 7-layer pipeline coordination (RAG → Switchboard → Draft/Autonomous dispatch)
-  - Media download from Meta CDN using streaming responses
-
-- **`outboundWorker.ts`**: Meta Graph API dispatch worker with:
-  - Template parameter compilation (`{{1}}` placeholder replacement)
-  - Local EC2 media file priority with R2 bucket fallback
-  - Draft message status promotion on approval (`draft` → `pending` → `sent`)
-  - MetaWamid registration for delivery status tracking
-
-- **Status tracking**: Designed the `status-msg-queue` pipeline that maps Meta's async `delivered`/`read` status webhooks back to `metaWamid` indexes in MongoDB, triggering real-time WebSocket updates to update inbox checkmark indicators.
+- Authored `replyLanguage.ts`, a code-level linguistic and script analyzer eliminating LLM language drift.
+- Built Unicode range matchers for Devanagari Hindi, Bengali, Punjabi, Gujarati, Odia, Tamil, Telugu, Kannada, Malayalam, and Urdu.
+- Built isolated word-boundary regex patterns for Roman-script Hinglish markers (`aap`, `kaise`, `kya`, `nahi`, `chahiye`, `batao`).
+- Built neutral token filters ("Hi", "Hello", "OK", "9:30 AM") to preserve established conversation language.
+- Guaranteed 100% language fidelity, completely eliminating unwanted flips to Hinglish on English chats.
 
 ---
 
-## 5. Real-Time WebSocket Synchronization
+## 5. Anti-Spam Marketing Guardrails & Suppressions
 
 **What I built:**
-
-The bidirectional real-time communication layer:
-
-- **`socketService.ts`**: Socket.io server integration with room-based event targeting. Implements `emitToRoom(conversationId, event, data)` for conversation-specific broadcasts and `emitGlobal(event, data)` for inbox-wide updates. Supports `join_room` for agents subscribing to specific conversation namespaces.
-
-- **`store.ts` (Zustand)**: Frontend state machine with mutation handlers for all WebSocket events:
-  - `handleIncomingMessage` — appends new messages, renders draft cards, increments unread badges
-  - `handleStatusUpdate` — mutates message status in place (`sent → delivered → read`)
-  - `handleConversationUpdate` — re-sorts thread list by `lastMessageAt` descending
-  - `handleChatClear` / `handleConversationDelete` — instant local state cleanup
-
-- **AI thinking indicator**: Implemented real-time "AI thinking" visual state — a WebSocket event emitted when the switchboard starts processing, consumed by the Zustand store to display a pulsing indicator in the chat UI.
+- Built `MarketingGuard.ts` to protect WhatsApp Business Account quality ratings from spam penalties.
+- Implemented strict frequency capping: max 1 template per 24 hours per template; max 3 marketing templates per 7 days per contact.
+- Built automated STOP opt-out handling (`marketingOptOut = true`).
+- Implemented **tiered delivery-failure suppression**:
+  - Permanent suppression on Meta error codes 131050 (user stopped marketing) and 131026 (undeliverable number).
+  - 24-hour temporary hold on Meta error code 131049 (Meta ecosystem healthy engagement cap).
+  - Guaranteed transactional immunity so UTILITY and AUTHENTICATION templates are never blocked.
 
 ---
 
-## 6. Zoho CRM/Books Integration Layer
+## 6. Proactive Health Watchdog & Token Auto-Renewal
 
 **What I built:**
-
-Complete read-write integration with Zoho India DC APIs:
-
-- **OAuth token management** (`zohoAuth.ts`): Auto-refreshing token lifecycle with `ZohoToken` MongoDB store. Token refresh is mutex-guarded to prevent race conditions when multiple concurrent requests trigger refresh simultaneously.
-
-- **CRM integration** (`zohoCRM.ts`): Contact search by phone number, deal lookup by contact ID with active filter, secure deal report URL extraction, and the whitelisted write operation for `Request Refund` (updates `Report_Status` to `"Asking Refund"` in Zoho CRM).
-
-- **Books integration** (`zohoBooks.ts`): Customer invoice lookup by email with Redis 15-minute caching.
-
-- **Sidebar UI** (`InboxLayout.tsx`): Built the Zoho CRM/Books sidebar panel showing deal cards with stage, amount, closing date, Report Status, and action buttons (Request Refund). Implemented the "Request Refund" button that calls the whitelisted backend endpoint with optimistic UI update.
-
-- **Two-factor Deal ID verification**: Implemented the regex extraction (`/\b\d{18,19}\b/g` for Deal IDs, email pattern) and Zoho cross-reference logic in the AI switchboard for secure link sharing.
+- Built `healthMonitor.ts` and `alertScheduler.ts` to detect silent failures before customer impact.
+- Automated Graph API audits validating Meta access tokens and warning 7 days prior to expiration.
+- Built an automatic renewal engine for 60-day Instagram User access tokens (`IGAA...`) at day 20, preventing silent DM auto-reply outages.
+- Implemented automated P1 WhatsApp alerts to engineering leads using Meta-approved `web_error_alert` templates.
 
 ---
 
-## 7. Authentication & Security System
+## 7. RAG Knowledge Base & Sentence-Aware Chunking
 
 **What I built:**
-
-Full authentication stack from scratch:
-
-- **`authController.ts`**: JWT-based login with bcrypt password verification, TOTP 2FA setup (secret generation + QR code export) and verification, HttpOnly secure cookie session management, and `/me` endpoint for browser session rehydration.
-
-- **Middleware chain** (`middleware/`): `authenticateJwt` for cookie/Bearer token parsing with role extraction, `authenticateApiKey` for external trigger API protection, `verifyWebhookSignature` for HMAC-SHA256 Meta webhook validation with constant-time comparison.
-
-- **`validateEnv.ts`**: Zod schema validation for all environment variables at server boot. Missing required variables cause `process.exit(1)` to prevent silent misconfiguration in production.
+- Built `ragPipeline.ts` using self-hosted Qdrant for 1536-dimensional vector search via OpenAI `text-embedding-3-small`.
+- Implemented sentence- and boundary-aware text chunking for uploaded PDFs and TXT documents in `VectorWorker.ts`.
+- Built Unicode text sanitization to strip emoji surrogate split characters that previously broke vector upserts.
+- Built MD5 point deduplication ensuring document re-uploads do not create duplicate vector points.
 
 ---
 
-## 8. Frontend Web Inbox
+## 8. Real-Time Frontend & Shared Inboxes
 
 **What I built:**
-
-Complete Next.js 16 web application with real-time inbox:
-
-- **`InboxLayout.tsx`**: The central workspace component — 4-column CSS grid layout, mount-time auth check with redirect, conversation list with open/closed status filtering, real-time WebSocket integration, AI draft card UI (Approve/Edit/Reject), media upload integration, and the 24-hour Meta reply window countdown timer.
-
-- **`ChatComposer.tsx`**: Message composition component with the AI Copilot dropdown menu — brand-compliant tone refinement, message expansion, and bullet-point compression modes, all using the 5-part context system via `/assist` endpoint.
-
-- **CSS Design System** (`globals.css`): Designed the full dark-mode design token system from scratch — deep obsidian backgrounds, emerald primary indicators, glassmorphism panels, custom Outfit font, and the 4-column responsive grid with CSS media query collapsing for iPad viewports.
-
-- **All pages**: Designed and built `/login`, `/inbox`, `/dashboard`, `/settings`, `/ai-settings`, `/queues`, and `/templates` pages with their respective data fetching and UI logic.
+- Built the Next.js 16 web application from scratch using the App Router and standalone Docker mode.
+- Developed the 4-column WhatsApp inbox (`InboxLayout.tsx`) featuring real-time WebSocket syncing, 24h Meta reply window countdown timers, live Zoho CRM deal sidebars, and Suggested Reply draft cards.
+- Developed `SocialInboxLayout.tsx`, a specialized inbox layout for Facebook Messenger and Instagram Direct channels.
+- Built the **AI Copilot Composer** (`ChatComposer.tsx`) offering tone refinements, expansion, and bullet-point compression.
+- Designed the full dark-mode design system (`globals.css`) with custom obsidian and emerald tokens.
 
 ---
 
-## 9. DevOps & CI/CD Pipeline
+## 9. Sales Funnel & Multi-Channel Attribution Analytics
 
 **What I built:**
-
-Complete containerization and automated deployment infrastructure:
-
-- **Multi-stage Dockerfiles**: 3-stage backend Dockerfile (Builder → Dependencies → Bun Runner) and 2-stage frontend Dockerfile leveraging Next.js standalone output.
-
-- **`docker-compose.prod.yml`**: Production container orchestration with bridge networking, persistent volumes for Qdrant and Redis, health check conditions, and service dependency ordering.
-
-- **GitHub Actions workflow**: Full CI/CD pipeline with lint + type-check gates, Docker BuildKit build with ECR push, active run concurrency detection, and SSH deploy step with selective image pull strategy (avoiding Docker Hub rate limits by pulling only ECR-hosted images).
+- Built `messagingAnalyticsController.ts` and `funnel.ts` to track and visualize customer journey drop-offs across 7 distinct stages.
+- Implemented channel-specific UTM attribution (`whatsapp_chat`, `instagram_chat`, `facebook_chat`) to track exact revenue contribution per channel.
+- Built frontend data visualizations (`MessagingAnalytics.tsx`, `SalesFunnel.tsx`, `MarketingOptOuts.tsx`) with universal date filtering.
+- Built the CSAT feedback state machine (`Feedback.ts`) collecting problem resolution ratings and qualitative feedback.
 
 ---
 
-## 10. Observability & Admin Tooling
+## 10. Database Modeling & DevOps CI/CD
 
 **What I built:**
-
-- **Cost analytics dashboard**: Aggregation pipeline on `CostTracking` collection, broken down by provider and model, rendered as Recharts SVG graphs.
-
-- **Queue management dashboard** (`/queues`): Real-time BullMQ metrics display with failed job inspection, bulk retry, bulk clean, and individual job retry/delete controls.
-
-- **Template broadcast system** (`/templates`): Meta Graph API template sync, interactive template grid, CSV file parsing for bulk recipient lists, and campaign broadcast queue management.
-
-- **Structured logging**: Winston configuration with correlation IDs (`service`, `operation`, `correlationId`) on every log entry, stdout JSON output in production for CloudWatch ingestion.
-
-- **`/healthz` endpoint**: Composite health check validating both MongoDB connection state and Redis readiness, returning `503` on degraded state.
+- Designed all 23 Mongoose collection schemas in MongoDB Atlas with compound indexes optimized for high-concurrency filtering and sorting.
+- Engineered zero-downtime GitHub Actions CI/CD deploying to AWS EC2 via Amazon ECR and multi-stage Docker builds.
+- Configured Nginx reverse proxy with SSL termination and 16MB file upload streaming.
 
 ---
 
-## Measurable Engineering Outcomes
+## 11. Measurable Production Outcomes (90-Day Telemetry)
 
-| Area | Metric | Achievement |
-|------|--------|-------------|
-| **Response latency** | Median customer response time | 4–12 hours → < 30 seconds |
-| **Scale** | Concurrent AI conversations | From ~50/day (human-limited) → Unlimited |
-| **Reliability** | Webhook duplicate processing | Zero duplicate messages (idempotency via `metaWamid`) |
-| **Security** | Private link exposure | Zero unauthorized URL exposure (ownership verification system) |
-| **Costs** | BSP subscription | Eliminated (direct Meta Cloud API integration) |
-| **Observability** | AI cost visibility | Per-conversation, per-model cost tracking in real time |
-| **Deployment** | Docker Hub rate limits | Zero deployment failures (selective ECR-only image pulls) |
-| **Memory** | Redis queue accumulation | Bounded (24h retention + 1000-job cap enforced) |
+The direct business and operational impact of these contributions over a 90-day live production window ([chat.maxfate.com/dashboard](https://chat.maxfate.com/dashboard)):
+
+- **Autonomous Scale**: Successfully handled **7,616 customer conversations** across WhatsApp (86.7%), Facebook Messenger (9.1%), and Instagram Direct (4.0%) with a **99.9% active AI coverage rate** (7,612 threads).
+- **High Autonomous Resolution**: Maintained a **96.94% autonomous AI resolution rate**, escalating only 233 conversations (3.06%) to human operators.
+- **Speed & Latency**: Slashed median response time from 4–12 hours to **53.5 seconds** across 2,054 sampled inbound response pairs.
+- **In-Chat Conversational Sales**: Converted **221 paid purchases** directly within chat out of 711 prospects entering buying flows — achieving an overall **31.1% in-chat conversion rate** (38.4% on WhatsApp, 32.2% on Messenger).
+- **Token & Cost Efficiency**: Processed **475.2 Million tokens** across 22,520 LLM completions for **$477.00 USD total spend**, averaging just **$0.062 per conversation**.
+- **Customer Satisfaction (CSAT)**: Achieved a **4.54 / 5.0 Star average rating** across 289 rated customer surveys, with **66.7%** reporting first-contact issue resolution.
+- **Anti-Spam Quality**: Maintained an **88.4% read rate** on delivered outbound messages with only 23 opt-outs (0.3%) and 56 suppressions out of 7,715 total contacts.

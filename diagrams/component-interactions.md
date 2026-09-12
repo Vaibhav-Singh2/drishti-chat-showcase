@@ -2,67 +2,83 @@
 
 ```mermaid
 graph LR
-    subgraph FE["Frontend — Next.js 16"]
-        AUTH_STORE["authStore.ts\nZustand\nSession state"]
-        INBOX_STORE["store.ts\nZustand\nConversations + Messages"]
-        SIDEBAR_STORE["sidebarStore.ts\nZustand\nNav state"]
-        SOCKET_CLIENT["socket.ts\nSocket.io-client\nautoConnect: false\nreconnectionAttempts: 10"]
-        IL["InboxLayout.tsx\nMain Workspace\n4-column CSS Grid"]
-        CC["ChatComposer.tsx\nAI Copilot Menu\nCharacter limits"]
-        SIDEBAR_C["Sidebar.tsx\nNav + Mobile Drawer"]
+    subgraph FE["Frontend — Next.js 16 (App Router)"]
+        AUTH_STORE["authStore.ts\nZustand · Session State"]
+        INBOX_STORE["store.ts\nZustand · Threads & Messages"]
+        SIDEBAR_STORE["sidebarStore.ts\nZustand · Navigation"]
+        SOCKET_CLIENT["socket.ts\nSocket.io-client (Rooms)"]
+        IL["InboxLayout.tsx\nWhatsApp Workspace"]
+        SIL["SocialInboxLayout.tsx\nMessenger & Instagram"]
+        CC["ChatComposer.tsx\nCopilot Menu & Tone"]
+        DASH_UI["SalesFunnel & Analytics\nRecharts SVG Visuals"]
+        MKTG_UI["MarketingOptOuts.tsx\nSuppressions Manager"]
     end
 
-    subgraph BE["Backend — Express + Bun"]
-        AUTH_C["authController\nJWT · bcrypt · TOTP"]
-        CHAT_C["chatController\nConversations · AI Toggle · Drafts"]
-        WEBHOOK_C["webhookController\nHMAC · Queue push"]
-        CONFIG_C["configController\nGlobalConfig · Provider Scoping"]
-        MEDIA_C["mediaController\nMulter · R2 presign"]
-        ANALYTICS_C["analyticsController\nCostTracking aggregation"]
-        QUEUE_C["queueController\nBullMQ metrics"]
-        TMPL_C["templateController\nMeta sync · Broadcasts"]
-        SOCK_S["socketService\nRoom-based emitter"]
-        AI_SW["aiSwitchboard\nProvider router\nFallback chain"]
-        RAG_P["ragPipeline\nQdrant search\n1536-dim cosine"]
-        ZOHO_CRM["zohoCRM\nContact + Deal lookup\nRefund write"]
-        ZOHO_BOOKS["zohoBooks\nInvoice lookup\nRedis 15min cache"]
-        ZOHO_AUTH["zohoAuth\nOAuth refresh\nZohoToken store"]
-        IW["inboundWorker\nFull pipeline\nIdempotency"]
-        OW["outboundWorker\nMeta API dispatch\nTemplate compile"]
-        VW["vectorWorker\nEmbed + Qdrant upsert\nFile cleanup logic"]
-        SW["statusWorker\nDelivery status\nmetaWamid lookup"]
-        AGENT_TOOLS["agentTools\n10 function-calling tools\nOwnership verification"]
+    subgraph BE["Backend — Express v5 + Bun"]
+        AUTH_C["authController\nJWT · 2FA TOTP"]
+        CHAT_C["chatController\nThreads · AI Toggle · Drafts"]
+        META_AC_C["metaAccountController\nPage & IG Credentials"]
+        WH_C["webhookController\nHMAC · Enqueue"]
+        MKTG_C["marketingController\nAnti-Spam APIs"]
+        ANALYTICS_C["messagingAnalyticsController\nSales Funnel Engine"]
+
+        subgraph INFRA["Infrastructure & Guardrails"]
+            LOCK["DistributedLock\nAtomic Redis SET PX NX"]
+            LANG["replyLanguage\nScript & Marker Detection"]
+            MGUARD["marketingGuard\nFrequency Caps & Opt-Outs"]
+            HEALTH["healthMonitor\nToken Watchdog & Alerts"]
+            WINDOW["conversationWindow\n24h Meta Window Auto-Close"]
+        end
+
+        subgraph AI["AI Reasoning & Tools"]
+            AI_SW["aiSwitchboard\nProvider Router & Fallbacks"]
+            RAG_P["ragPipeline\nSentence-Aware Qdrant Search"]
+            AGENT_TOOLS["agentTools (x26 Tools)\nLookup · Pay · Checkout · CSAT"]
+            CHECKOUT["checkoutState\nIn-Chat Slot-Filling Machine"]
+        end
+
+        subgraph WORKERS["BullMQ Workers"]
+            IW["inboundWorker\nFull Pipeline Coordination"]
+            OW["outboundWorker\nMeta Cloud API Dispatches"]
+            VW["vectorWorker\nPDF/TXT Ingestion Pipeline"]
+            SW["statusWorker\nDelivery Status Tracking"]
+        end
+
+        SOCK_S["socketService\nRoom-Targeted Emitter"]
     end
 
-    %% Frontend internal
-    IL --> AUTH_STORE & INBOX_STORE & SOCKET_CLIENT
-    IL --> CC & SIDEBAR_C
-    SIDEBAR_C --> SIDEBAR_STORE
+    %% Frontend Internal
+    IL & SIL --> AUTH_STORE & INBOX_STORE & SOCKET_CLIENT
+    IL & SIL --> CC
+    DASH_UI --> INBOX_STORE
 
-    %% Frontend → Backend HTTP
+    %% Frontend <-> Backend HTTP
     AUTH_STORE <-->|"/auth/*"| AUTH_C
     INBOX_STORE <-->|"/conversations/*"| CHAT_C
-    CC -->|"/conversations/:id/assist"| CHAT_C
-    IL -->|"/media/upload"| MEDIA_C
-    IL -->|"/zoho/*"| CHAT_C
+    SIL <-->|"/meta-accounts/*"| META_AC_C
+    DASH_UI <-->|"/analytics/*"| ANALYTICS_C
+    MKTG_UI <-->|"/marketing/*"| MKTG_C
 
-    %% Frontend → Backend WebSocket
-    SOCKET_CLIENT <-->|"WebSocket"| SOCK_S
-
-    %% Backend service graph
-    WEBHOOK_C --> IW
-    IW --> RAG_P & AI_SW & ZOHO_CRM & ZOHO_BOOKS & SOCK_S
-    AI_SW --> AGENT_TOOLS
-    AGENT_TOOLS --> ZOHO_CRM & ZOHO_BOOKS & RAG_P
-    IW --> OW
-    OW --> SOCK_S
-    ZOHO_CRM & ZOHO_BOOKS --> ZOHO_AUTH
-    CONFIG_C --> AI_SW
-    VW --> RAG_P
-
-    %% Emit events
-    SOCK_S -->|"message_new\nmessage_status\nconversation_update\nchat_clear\nconversation_delete"| SOCKET_CLIENT
-
-    %% Zustand consumers
+    %% Real-Time WebSocket
+    SOCKET_CLIENT <-->|"WebSocket Rooms"| SOCK_S
+    SOCK_S -->|"message_new · message_status · ai_thinking"| SOCKET_CLIENT
     SOCKET_CLIENT --> INBOX_STORE
+
+    %% Inbound Processing Graph
+    WH_C --> IW
+    IW --> LOCK
+    IW --> LANG
+    IW --> RAG_P
+    IW --> AI_SW
+    AI_SW --> AGENT_TOOLS
+    AGENT_TOOLS --> CHECKOUT
+    IW --> OW
+    OW --> MGUARD
+    IW --> SOCK_S
+    OW --> SOCK_S
+    SW --> SOCK_S
+
+    %% Housekeeping & Monitoring
+    HEALTH --> OW
+    WINDOW --> CHAT_C
 ```
