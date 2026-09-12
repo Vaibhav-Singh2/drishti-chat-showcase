@@ -4,11 +4,14 @@
 
 ---
 
-## 📺 Live Video Walkthrough
+## 📺 Live Video Walkthrough (Initial Launch Recording)
 
 > 🔗 **[Watch Full Platform Walkthrough on Google Drive](https://drive.google.com/file/d/1qsN0ZLRJXgkSQzIgWk0Hy7fjwcmx8TiG/view?usp=sharing)**
 >
-> *A recorded walkthrough showcasing the real-time WhatsApp & social inboxes, autonomous 26-tool agent reasoning in action, live Zoho CRM sidebar integration, conversational in-chat checkout flow, template broadcasting, and the 90-day production analytics dashboard.*
+> *A recorded walkthrough showcasing the real-time WhatsApp & social inboxes, autonomous AI tool reasoning, live Zoho CRM sidebar integration, conversational in-chat checkout, and template broadcasting.*
+
+> [!NOTE]
+> **Timeline & Telemetry Alignment**: The demo video and the 12 screenshots below were captured during the platform's **initial production launch milestone** (early 30-day rollout with ~24.5M tokens). For the mature, full-scale production metrics after **90 days of live operation** (475.2M tokens, $477 total spend, 7,616 conversations, and 31.1% in-chat sales conversion), please refer to the [Live Production Metrics in README.md](README.md#live-production-metrics-90-day-telemetry).
 
 ---
 

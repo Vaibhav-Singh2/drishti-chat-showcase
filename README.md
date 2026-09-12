@@ -14,11 +14,14 @@ The result: median customer response time dropped from **4–12 hours → ~53 se
 
 ---
 
-## 📺 Live Demo Video Walkthrough
+## 📺 Live Demo Video Walkthrough (Early Launch Recording)
 
 > 🔗 **[Watch Full Platform Walkthrough on Google Drive](https://drive.google.com/file/d/1qsN0ZLRJXgkSQzIgWk0Hy7fjwcmx8TiG/view?usp=sharing)**
 >
-> *A comprehensive recorded demo demonstrating the live platform in action: real-time WhatsApp & social inboxes, autonomous 26-tool agent reasoning, live Zoho CRM sidebars, conversational in-chat checkout, Meta template broadcasting, and the 90-day production analytics dashboard.*
+> *A recorded walkthrough demonstrating the platform's core UX: real-time WhatsApp & social inboxes, autonomous 26-tool agent reasoning, live Zoho CRM sidebars, conversational in-chat checkout, Meta template broadcasting, and the early analytics dashboard.*
+
+> [!NOTE]
+> **Media vs. Production Telemetry**: This recorded demo video and the UI screenshots in [screenshots.md](screenshots.md) capture the platform during its **initial launch milestone** (early 30-day token validation). The section below documents the platform's mature performance after **90 days of sustained production scaling** (growing from the early ~25M token baseline to over 475M tokens and 7,600+ conversations).
 
 ---
 
@@ -210,7 +213,8 @@ project-showcase/
 ## Screenshots & Live Demo
 
 > 📺 **Video Demo**: [Watch Full Platform Walkthrough on Google Drive](https://drive.google.com/file/d/1qsN0ZLRJXgkSQzIgWk0Hy7fjwcmx8TiG/view?usp=sharing)  
-> 🖼️ **Full UI Gallery**: See [screenshots.md](screenshots.md) for the complete 12-screenshot gallery with detailed technical captions.
+> 🖼️ **Full UI Gallery**: See [screenshots.md](screenshots.md) for the complete 12-screenshot gallery with detailed technical captions.  
+> *(Note: Visual media captured during initial launch rollout; see 90-day scorecard above for mature production scale).*
 
 | Inbox (WhatsApp + Zoho CRM) | Token Cost Analytics |
 |---|---|
